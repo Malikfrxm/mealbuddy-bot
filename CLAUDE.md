@@ -3,8 +3,8 @@
 - **Age:** 22
 - **Weight:** 111 lbs
 - **Height:** 5'9"
-- **Goal:** Bulk — gain 50 lbs of muscle over time
-- **Location:** Norwalk, CT 06854
+- **Goal:** Bulk — gain 50 lbs 
+
 
 # Nutrition Targets
 - **Daily calories:** 2,700 minimum (hard floor)
