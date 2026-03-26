@@ -3,3 +3,5 @@ twilio
 anthropic
 apscheduler
 pytz
+openai
+requests
