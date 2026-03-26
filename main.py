@@ -1,8 +1,11 @@
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 import anthropic
+import openai
+import requests as http_requests
 from twilio.rest import Client
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
@@ -17,8 +20,18 @@ CLAUDE_MD_PATH = Path(__file__).parent / "CLAUDE.md"
 USERS_DIR = Path(__file__).parent / "users"
 
 app = Flask(__name__)
-
 conversation_histories: dict[str, list[dict]] = {}
+
+# Audio MIME types Twilio may deliver for WhatsApp voice memos
+AUDIO_MIME_TYPES = {
+    "audio/ogg": "ogg",
+    "audio/mp4": "mp4",
+    "audio/mpeg": "mp3",
+    "audio/wav": "wav",
+    "audio/webm": "webm",
+    "audio/3gpp": "3gp",
+    "audio/amr": "amr",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -32,7 +45,7 @@ def load_context(user_number: str = "") -> str:
         if user_file.exists():
             return user_file.read_text(encoding="utf-8").strip()
 
-    # Fallback for unknown numbers or legacy usage
+    # Fallback for unknown numbers
     if CLAUDE_MD_PATH.exists():
         return CLAUDE_MD_PATH.read_text(encoding="utf-8").strip()
 
@@ -41,10 +54,56 @@ def load_context(user_number: str = "") -> str:
 
 
 def get_registered_numbers() -> list[str]:
-    """Return a list of phone numbers that have a context file in users/."""
+    """Return list of phone numbers that have a profile file in users/."""
     if not USERS_DIR.exists():
         return []
     return [f.stem for f in USERS_DIR.glob("*.md")]
+
+
+def transcribe_audio(media_url: str) -> str:
+    """Download a Twilio audio attachment and transcribe it with OpenAI Whisper."""
+    openai_key = os.environ.get("OPENAI_API_KEY")
+    if not openai_key:
+        print("Warning: OPENAI_API_KEY not set — cannot transcribe audio.")
+        return "[Audio message received, but transcription is not configured]"
+
+    account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
+    auth_token = os.environ.get("TWILIO_AUTH_TOKEN")
+
+    # Twilio protects media URLs — authenticate with account credentials
+    try:
+        audio_resp = http_requests.get(
+            media_url, auth=(account_sid, auth_token), timeout=30
+        )
+        audio_resp.raise_for_status()
+    except Exception as exc:
+        print(f"Error downloading audio from Twilio: {exc}")
+        return "[Could not retrieve audio message]"
+
+    # Determine file extension from Content-Type (strip codec suffix if present)
+    content_type = audio_resp.headers.get("Content-Type", "audio/ogg")
+    base_type = content_type.split(";")[0].strip()
+    ext = AUDIO_MIME_TYPES.get(base_type, "ogg")
+
+    # Write to a temp file so the OpenAI SDK can stream it
+    with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as tmp:
+        tmp.write(audio_resp.content)
+        tmp_path = Path(tmp.name)
+
+    try:
+        client_oai = openai.OpenAI(api_key=openai_key)
+        with open(tmp_path, "rb") as audio_file:
+            transcript = client_oai.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file,
+            )
+        print(f"Whisper transcription: {transcript.text!r}")
+        return transcript.text
+    except Exception as exc:
+        print(f"Whisper transcription error: {exc}")
+        return "[Audio transcription failed]"
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def generate_reply(sender: str, incoming_msg: str) -> str:
@@ -71,10 +130,8 @@ def generate_reply(sender: str, incoming_msg: str) -> str:
         system=system_prompt,
         messages=history,
     )
-
     reply = response.content[0].text
     history.append({"role": "assistant", "content": reply})
-
     return reply
 
 
@@ -97,40 +154,38 @@ def send_whatsapp(message: str, to_number: str = "") -> None:
 
 
 def saturday_kickoff() -> None:
-    """Send the Saturday kickoff message to all registered users."""
+    """Send the Saturday 7PM kickoff to every registered user."""
     print("Running Saturday kickoff job...")
 
-    # Build the list of numbers to message
     registered = get_registered_numbers()
     fallback_number = os.environ.get("MY_PHONE_NUMBER", "")
 
-    # If no users/ folder yet, fall back to env var
-    if not registered and fallback_number:
-        registered = [fallback_number]
-    elif not registered:
-        print("Error: No registered users and MY_PHONE_NUMBER not set. Skipping.")
+    all_numbers = set(registered)
+    if fallback_number:
+        all_numbers.add(fallback_number)
+
+    if not all_numbers:
+        print("No registered users and MY_PHONE_NUMBER not set — skipping.")
         return
 
-    for phone_number in registered:
-        sender_key = f"whatsapp:{phone_number}"
-
-        # Load this user's context to personalize the greeting
+    for number in all_numbers:
+        sender_key = f"whatsapp:{number}"
         context = load_context(sender_key)
 
-        # Extract a name from the context if available, otherwise use a generic greeting
+        # Extract first name from the profile if possible
         name = "there"
         if context:
             for line in context.splitlines():
                 lower = line.lower()
                 if "name:" in lower or "name is" in lower:
-                    # Grab the value after "name:" or "name is"
                     for sep in ["name:", "name is"]:
                         if sep in lower:
                             name = line.split(sep, 1)[1].strip().split()[0]
+                            name = name.strip("*_#")
                             break
                     break
 
-        # Clear conversation history for a fresh week
+        # Reset conversation history for a fresh weekly plan
         conversation_histories[sender_key] = []
 
         opening_msg = (
@@ -143,10 +198,10 @@ def saturday_kickoff() -> None:
         )
 
         try:
-            send_whatsapp(opening_msg, phone_number)
-            print(f"Saturday kickoff sent to {phone_number}!")
-        except Exception as e:
-            print(f"Error sending to {phone_number}: {e}")
+            send_whatsapp(opening_msg, number)
+            print(f"Saturday kickoff sent to {number}")
+        except Exception as exc:
+            print(f"Error sending kickoff to {number}: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -156,11 +211,29 @@ def saturday_kickoff() -> None:
 def webhook():
     incoming_msg = request.form.get("Body", "").strip()
     sender = request.form.get("From", "")
+    num_media = int(request.form.get("NumMedia", "0"))
 
-    print(f"Incoming WhatsApp message from {sender}: {incoming_msg}")
+    print(f"Message from {sender} | text={incoming_msg!r} | media={num_media}")
+
+    # --- Voice memo / audio MMS handling ---
+    if num_media > 0:
+        media_url = request.form.get("MediaUrl0", "")
+        media_type = request.form.get("MediaContentType0", "")
+        base_type = media_type.split(";")[0].strip()
+
+        if media_url and base_type.startswith("audio/"):
+            print(f"Audio attachment ({media_type}) — sending to Whisper...")
+            incoming_msg = transcribe_audio(media_url)
+        elif not incoming_msg:
+            # Non-audio media with no text — acknowledge and bail
+            resp = MessagingResponse()
+            resp.message("(I received a media file but can only process audio and text.)")
+            return str(resp)
+
+    if not incoming_msg:
+        return str(MessagingResponse())
 
     reply_text = generate_reply(sender, incoming_msg)
-
     resp = MessagingResponse()
     resp.message(reply_text)
     return str(resp)
@@ -168,7 +241,8 @@ def webhook():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return "MealBuddy webhook server is running.", 200
+    registered = get_registered_numbers()
+    return f"MealBuddy running. Registered users: {registered}", 200
 
 
 @app.route("/saturday", methods=["GET"])
@@ -176,8 +250,8 @@ def trigger_saturday():
     try:
         saturday_kickoff()
         return "Saturday kickoff triggered successfully!", 200
-    except Exception as e:
-        return f"Error: {e}", 500
+    except Exception as exc:
+        return f"Error: {exc}", 500
 
 
 # ---------------------------------------------------------------------------
@@ -198,19 +272,17 @@ if __name__ == "__main__":
         scheduler.start()
         print("Saturday scheduler started -- fires every Saturday at 7:00 PM ET")
 
-        # Log registered users on startup
         registered = get_registered_numbers()
         if registered:
             print(f"Registered users: {', '.join(registered)}")
         else:
-            print("No users/ folder found — using CLAUDE.md as fallback context.")
+            print("No users registered yet (add .md files to users/ directory).")
 
         print(f"Starting MealBuddy WhatsApp webhook server on port {port}...")
         app.run(host="0.0.0.0", port=port, debug=False)
-
     else:
         try:
             saturday_kickoff()
-        except Exception as e:
-            print(f"Error: {e}", file=sys.stderr)
+        except Exception as exc:
+            print(f"Error: {exc}", file=sys.stderr)
             sys.exit(1)
