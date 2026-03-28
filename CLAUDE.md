@@ -75,8 +75,7 @@ BREAKFAST (every day):
 Power Shake - ~1,100 cal, 30g Protein
 
 MEAL PREP SUNDAY:
-- Cook: [item 1], [item 2], [item 3]
-- Batch: [e.g. 5 cups rice, 2 lbs beef]
+-Batch cook: X, Y, Z etc
 
 DAILY MEALS:
 Lunch: [meal] (~Xcal, Xg protein)
